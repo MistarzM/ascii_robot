@@ -2,7 +2,9 @@ use image::DynamicImage;
 use nokhwa::{
     pixel_format::RgbFormat,
     query,
-    utils::{ApiBackend, CameraIndex, RequestedFormat, RequestedFormatType},
+    utils::{
+        ApiBackend, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
+    },
     Camera,
 };
 use std::sync::{Arc, Mutex};
@@ -107,11 +109,22 @@ impl App {
 
         println!("Found {} cameras - Using first camera", cameras.len());
         let index = CameraIndex::Index(0);
+
+        // Get camera info
+        let camera_info = &cameras[0];
+        println!("Camera name: {}", camera_info.human_name());
+
+        // Try to find a compatible format
         let format =
-            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
 
         let mut camera = Camera::new(index, format)?;
-        camera.open_stream()?; // Changed to open_stream()
+
+        // Set a specific resolution that matches our window size
+        let resolution = Resolution::new(640, 480);
+        camera.set_resolution(resolution)?;
+
+        camera.open_stream()?;
 
         self.camera = Some(Arc::new(Mutex::new(camera)));
         Ok(())
@@ -123,33 +136,47 @@ impl App {
 
         // Create shader module
         let shader_source = r#"
-            @vertex
-            fn vs_main(@builtin(vertex_index) vert_idx: u32) -> @builtin(position) vec4<f32> {
-                let pos = array<vec2<f32>, 4>(
-                    vec2<f32>(-1.0, -1.0),
-                    vec2<f32>(-1.0, 1.0),
-                    vec2<f32>(1.0, -1.0),
-                    vec2<f32>(1.0, 1.0)
-                );
-                return vec4<f32>(pos[vert_idx], 0.0, 1.0);
-            }
+    @vertex
+    fn vs_main(@builtin(vertex_index) vert_idx: u32) -> @builtin(position) vec4<f32> {
+        let pos = array<vec2<f32>, 4>(
+            vec2<f32>(-1.0, -1.0),
+            vec2<f32>(-1.0, 1.0),
+            vec2<f32>(1.0, -1.0),
+            vec2<f32>(1.0, 1.0)
+        );
+        return vec4<f32>(pos[vert_idx], 0.0, 1.0);
+    }
 
-            @group(0) @binding(0)
-            var camera_tex: texture_2d<f32>;
+    @group(0) @binding(0)
+    var camera_tex: texture_2d<f32>;
 
-            @group(0) @binding(1)
-            var camera_sampler: sampler;
+    @group(0) @binding(1)
+    var camera_sampler: sampler;
 
-            @fragment
-            fn fs_main(@builtin(position) frag_coord: vec4<f32>) 
-                -> @location(0) vec4<f32> {
-                let uv = vec2<f32>(frag_coord.x / 640.0, frag_coord.y / 480.0);
-                return textureSample(camera_tex, camera_sampler, uv);
-            }
-        "#;
+    @fragment
+    fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
+        // Get texture size
+        let texture_size = textureDimensions(camera_tex);
+        let tex_width = f32(texture_size.x);
+        let tex_height = f32(texture_size.y);
+        
+        // Calculate aspect-correct UV coordinates
+        let screen_aspect = 640.0 / 480.0;
+        let tex_aspect = tex_width / tex_height;
+        var uv = vec2<f32>(frag_coord.x / 640.0, 1.0 - frag_coord.y / 480.0);
+        
+        // Adjust for aspect ratio
+        if tex_aspect > screen_aspect {
+            uv.x = (uv.x - 0.5) * (screen_aspect / tex_aspect) + 0.5;
+        } else {
+            uv.y = (uv.y - 0.5) * (tex_aspect / screen_aspect) + 0.5;
+        }
+        
+        return textureSample(camera_tex, camera_sampler, uv);
+    }
+"#;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            // Removed &
             label: Some("Camera Shader"),
             source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
@@ -190,25 +217,25 @@ impl App {
             layout: Some(&pipeline_layout),
             vertex: VertexState {
                 module: &shader,
-                entry_point: Some("vs_main"), // Removed Some()
+                entry_point: Some("vs_main"),
                 buffers: &[],
-                compilation_options: Default::default(), // Added
+                compilation_options: Default::default(),
             },
             fragment: Some(FragmentState {
                 module: &shader,
-                entry_point: Some("fs_main"), // Removed Some()
+                entry_point: Some("fs_main"),
                 targets: &[Some(ColorTargetState {
                     format: config.format,
                     blend: None,
                     write_mask: ColorWrites::ALL,
                 })],
-                compilation_options: Default::default(), // Added
+                compilation_options: Default::default(),
             }),
             primitive: PrimitiveState::default(),
             depth_stencil: None,
             multisample: MultisampleState::default(),
             multiview: None,
-            cache: None, // Added
+            cache: None,
         });
 
         // Create sampler
@@ -225,7 +252,7 @@ impl App {
 
         self.camera_sampler = Some(sampler);
         self.camera_pipeline = Some(pipeline);
-        self.camera_bind_group_layout = Some(bind_group_layout); // Store layout
+        self.camera_bind_group_layout = Some(bind_group_layout);
 
         Ok(())
     }
@@ -243,16 +270,47 @@ impl App {
 
         let mut camera = camera.lock().unwrap();
 
+        // Get camera settings
+        let resolution = camera.resolution();
+        let width = resolution.width() as u32;
+        let height = resolution.height() as u32;
+        let fmt = camera.camera_format().format();
+
         if let Ok(frame) = camera.frame() {
-            let frame_buffer = frame.decode_image::<RgbFormat>()?;
-            let image = DynamicImage::ImageRgb8(frame_buffer);
-            let width = image.width();
-            let height = image.height();
+            // Convert to RGBA based on the frame format
+            let rgba = match fmt {
+                FrameFormat::NV12 => {
+                    // Handle NV12 format specifically
+                    let buffer = frame.buffer();
+                    let mut rgba = vec![0u8; (width * height * 4) as usize];
 
-            // Convert to RGBA format
-            let rgba = image.to_rgba8();
+                    // For NV12, stride is typically width
+                    let stride = width as usize;
 
-            // Create texture if it doesn't exist or if size changed
+                    println!(
+                        "NV12 frame: width={}, height={}, stride={}, buffer_len={}",
+                        width,
+                        height,
+                        stride,
+                        buffer.len()
+                    );
+
+                    Self::nv12_to_rgba(buffer, &mut rgba, width as usize, height as usize, stride);
+                    rgba
+                }
+                _ => {
+                    // Try to decode other formats
+                    if let Ok(decoded) = frame.decode_image::<RgbFormat>() {
+                        // Convert to DynamicImage then to RGBA
+                        DynamicImage::ImageRgb8(decoded).to_rgba8().to_vec()
+                    } else {
+                        eprintln!("Failed to decode frame format: {:?}", fmt);
+                        return Ok(());
+                    }
+                }
+            };
+
+            // Create or update texture
             if self.camera_texture.is_none()
                 || self.camera_texture.as_ref().unwrap().width() != width
                 || self.camera_texture.as_ref().unwrap().height() != height
@@ -276,7 +334,7 @@ impl App {
                 self.camera_texture = Some(texture);
                 self.camera_texture_view = Some(view);
 
-                // Create bind group if we have all components
+                // Recreate bind group if needed
                 if let (Some(view), Some(layout), Some(sampler)) = (
                     &self.camera_texture_view,
                     &self.camera_bind_group_layout,
@@ -300,11 +358,10 @@ impl App {
                 }
             }
 
-            // Update texture with new frame data
+            // Update texture
             if let Some(texture) = &self.camera_texture {
                 queue.write_texture(
                     TexelCopyTextureInfo {
-                        // Updated type
                         texture,
                         mip_level: 0,
                         origin: Origin3d::ZERO,
@@ -312,7 +369,6 @@ impl App {
                     },
                     &rgba,
                     TexelCopyBufferLayout {
-                        // Updated type
                         offset: 0,
                         bytes_per_row: Some(4 * width),
                         rows_per_image: Some(height),
@@ -328,22 +384,57 @@ impl App {
         Ok(())
     }
 
+    fn nv12_to_rgba(nv12: &[u8], rgba: &mut [u8], width: usize, height: usize, stride: usize) {
+        let y_plane_size = stride * height;
+        let uv_plane_size = stride * height / 2;
+
+        if nv12.len() < y_plane_size + uv_plane_size {
+            eprintln!(
+                "NV12 buffer too small: expected {}, got {}",
+                y_plane_size + uv_plane_size,
+                nv12.len()
+            );
+            return;
+        }
+
+        let y_plane = &nv12[0..y_plane_size];
+        let uv_plane = &nv12[y_plane_size..y_plane_size + uv_plane_size];
+
+        for y in 0..height {
+            for x in 0..width {
+                let y_index = y * stride + x;
+                let uv_index = (y / 2) * stride + (x & !1);
+
+                let y_val = y_plane[y_index] as f32;
+                let u_val = uv_plane[uv_index] as i32 - 128;
+                let v_val = uv_plane[uv_index + 1] as i32 - 128;
+
+                // Convert YUV to RGB
+                let r = (y_val + 1.402 * v_val as f32).clamp(0.0, 255.0) as u8;
+                let g =
+                    (y_val - 0.344 * u_val as f32 - 0.714 * v_val as f32).clamp(0.0, 255.0) as u8;
+                let b = (y_val + 1.772 * u_val as f32).clamp(0.0, 255.0) as u8;
+
+                let rgba_index = (y * width + x) * 4;
+                rgba[rgba_index] = r;
+                rgba[rgba_index + 1] = g;
+                rgba[rgba_index + 2] = b;
+                rgba[rgba_index + 3] = 255; // Alpha
+            }
+        }
+    }
+
     fn render(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Update camera texture with the latest frame
         if let Err(e) = self.update_camera_texture() {
             eprintln!("Camera update failed: {}", e);
         }
 
-        let (surface, device, queue, _config) = match (
-            // Added _ to config
-            &self.surface,
-            &self.device,
-            &self.queue,
-            &self.config,
-        ) {
-            (Some(s), Some(d), Some(q), Some(c)) => (s, d, q, c),
-            _ => return Ok(()),
-        };
+        let (surface, device, queue, _config) =
+            match (&self.surface, &self.device, &self.queue, &self.config) {
+                (Some(s), Some(d), Some(q), Some(c)) => (s, d, q, c),
+                _ => return Ok(()),
+            };
 
         let frame = surface.get_current_texture()?;
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
