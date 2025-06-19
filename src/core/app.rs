@@ -70,16 +70,28 @@ impl App {
             force_fallback_adapter: false,
         }))?;
 
+        // Get GPU limits
+        let limits = adapter.limits();
+        let max_texture_dimension = limits.max_texture_dimension_2d;
+        println!("GPU max texture dimension: {}", max_texture_dimension);
+
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits: limits,
                 label: None,
                 memory_hints: Default::default(),
                 trace: Default::default(),
             }))?;
 
-        let size = window.inner_size();
+        // Get window size and clamp to GPU limits
+        let mut size = window.inner_size();
+        println!("Requested window size: {}x{}", size.width, size.height);
+
+        size.width = size.width.clamp(1, max_texture_dimension);
+        size.height = size.height.clamp(1, max_texture_dimension);
+        println!("Clamped window size: {}x{}", size.width, size.height);
+
         let surface_caps = surface.get_capabilities(&adapter);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -120,8 +132,8 @@ impl App {
 
         let mut camera = Camera::new(index, format)?;
 
-        // Set a specific resolution that matches our window size
-        let resolution = Resolution::new(640, 480);
+        // Set to 720p resolution
+        let resolution = Resolution::new(1280, 720);
         camera.set_resolution(resolution)?;
 
         camera.open_stream()?;
@@ -136,15 +148,31 @@ impl App {
 
         // Create shader module
         let shader_source = r#"
+    struct VertexOutput {
+        @builtin(position) position: vec4<f32>,
+        @location(0) uv: vec2<f32>,
+    }
+
     @vertex
-    fn vs_main(@builtin(vertex_index) vert_idx: u32) -> @builtin(position) vec4<f32> {
+    fn vs_main(@builtin(vertex_index) vert_idx: u32) -> VertexOutput {
         let pos = array<vec2<f32>, 4>(
-            vec2<f32>(-1.0, -1.0),
-            vec2<f32>(-1.0, 1.0),
-            vec2<f32>(1.0, -1.0),
-            vec2<f32>(1.0, 1.0)
+            vec2<f32>(-1.0, -1.0),  // Bottom-left
+            vec2<f32>(-1.0, 1.0),   // Top-left
+            vec2<f32>(1.0, -1.0),   // Bottom-right
+            vec2<f32>(1.0, 1.0)     // Top-right
         );
-        return vec4<f32>(pos[vert_idx], 0.0, 1.0);
+        
+        let uv = array<vec2<f32>, 4>(
+            vec2<f32>(0.0, 1.0),  // Bottom-left
+            vec2<f32>(0.0, 0.0),  // Top-left
+            vec2<f32>(1.0, 1.0),  // Bottom-right
+            vec2<f32>(1.0, 0.0)   // Top-right
+        );
+        
+        var output: VertexOutput;
+        output.position = vec4<f32>(pos[vert_idx], 0.0, 1.0);
+        output.uv = uv[vert_idx];
+        return output;
     }
 
     @group(0) @binding(0)
@@ -154,25 +182,8 @@ impl App {
     var camera_sampler: sampler;
 
     @fragment
-    fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
-        // Get texture size
-        let texture_size = textureDimensions(camera_tex);
-        let tex_width = f32(texture_size.x);
-        let tex_height = f32(texture_size.y);
-        
-        // Calculate aspect-correct UV coordinates
-        let screen_aspect = 640.0 / 480.0;
-        let tex_aspect = tex_width / tex_height;
-        var uv = vec2<f32>(frag_coord.x / 640.0, 1.0 - frag_coord.y / 480.0);
-        
-        // Adjust for aspect ratio
-        if tex_aspect > screen_aspect {
-            uv.x = (uv.x - 0.5) * (screen_aspect / tex_aspect) + 0.5;
-        } else {
-            uv.y = (uv.y - 0.5) * (tex_aspect / screen_aspect) + 0.5;
-        }
-        
-        return textureSample(camera_tex, camera_sampler, uv);
+    fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+        return textureSample(camera_tex, camera_sampler, input.uv);
     }
 "#;
 
@@ -276,7 +287,11 @@ impl App {
         let height = resolution.height() as u32;
         let fmt = camera.camera_format().format();
 
+        println!("Camera format: {:?}, resolution: {}x{}", fmt, width, height);
+
         if let Ok(frame) = camera.frame() {
+            println!("Frame buffer size: {}", frame.buffer().len());
+
             // Convert to RGBA based on the frame format
             let rgba = match fmt {
                 FrameFormat::NV12 => {
@@ -334,7 +349,7 @@ impl App {
                 self.camera_texture = Some(texture);
                 self.camera_texture_view = Some(view);
 
-                // Recreate bind group if needed
+                // Recreate bind group
                 if let (Some(view), Some(layout), Some(sampler)) = (
                     &self.camera_texture_view,
                     &self.camera_bind_group_layout,
@@ -380,6 +395,8 @@ impl App {
                     },
                 );
             }
+        } else {
+            eprintln!("Failed to capture frame from camera");
         }
         Ok(())
     }
@@ -403,17 +420,16 @@ impl App {
         for y in 0..height {
             for x in 0..width {
                 let y_index = y * stride + x;
-                let uv_index = (y / 2) * stride + (x & !1);
+                let uv_index = (y / 2) * (stride / 2) + (x / 2);
 
                 let y_val = y_plane[y_index] as f32;
-                let u_val = uv_plane[uv_index] as i32 - 128;
-                let v_val = uv_plane[uv_index + 1] as i32 - 128;
+                let u_val = uv_plane[uv_index] as f32 - 128.0;
+                let v_val = uv_plane[uv_index + 1] as f32 - 128.0;
 
-                // Convert YUV to RGB
-                let r = (y_val + 1.402 * v_val as f32).clamp(0.0, 255.0) as u8;
-                let g =
-                    (y_val - 0.344 * u_val as f32 - 0.714 * v_val as f32).clamp(0.0, 255.0) as u8;
-                let b = (y_val + 1.772 * u_val as f32).clamp(0.0, 255.0) as u8;
+                // Use standard BT.709 conversion coefficients
+                let r = (y_val + 1.402 * v_val).clamp(0.0, 255.0) as u8;
+                let g = (y_val - 0.344136 * u_val - 0.714136 * v_val).clamp(0.0, 255.0) as u8;
+                let b = (y_val + 1.772 * u_val).clamp(0.0, 255.0) as u8;
 
                 let rgba_index = (y * width + x) * 4;
                 rgba[rgba_index] = r;
@@ -474,6 +490,34 @@ impl App {
 
         Ok(())
     }
+
+    fn handle_resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        if let (Some(surface), Some(device), Some(config)) =
+            (&self.surface, &self.device, &mut self.config)
+        {
+            // Get GPU limits
+            let max_texture_dimension = device.limits().max_texture_dimension_2d;
+
+            // Clamp new size to GPU limits
+            let width = new_size.width.clamp(1, max_texture_dimension);
+            let height = new_size.height.clamp(1, max_texture_dimension);
+
+            if width != config.width || height != config.height {
+                println!(
+                    "Resizing to: {}x{} (max: {})",
+                    width, height, max_texture_dimension
+                );
+                config.width = width;
+                config.height = height;
+                surface.configure(device, config);
+            }
+
+            // Request redraw after resize
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -482,10 +526,11 @@ impl ApplicationHandler for App {
             return;
         }
 
+        // Create window at 1280x720 resolution
         let window = match event_loop.create_window(
             WindowAttributes::default()
                 .with_title("Camera Viewer")
-                .with_inner_size(winit::dpi::LogicalSize::new(640, 480)),
+                .with_inner_size(winit::dpi::LogicalSize::new(1280, 720)),
         ) {
             Ok(w) => w,
             Err(e) => {
@@ -521,9 +566,14 @@ impl ApplicationHandler for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Only handle events for our window
+        if self.window.as_ref().map(|w| w.id()) != Some(window_id) {
+            return;
+        }
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
@@ -536,12 +586,15 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Resized(new_size) => {
-                if let (Some(surface), Some(device), Some(config)) =
-                    (&self.surface, &self.device, &mut self.config)
-                {
-                    config.width = new_size.width;
-                    config.height = new_size.height;
-                    surface.configure(device, config);
+                self.handle_resize(new_size);
+            }
+            WindowEvent::ScaleFactorChanged {
+                inner_size_writer: _,
+                scale_factor: _,
+            } => {
+                if let Some(window) = &self.window {
+                    let new_size = window.inner_size();
+                    self.handle_resize(new_size);
                 }
             }
             _ => {}
