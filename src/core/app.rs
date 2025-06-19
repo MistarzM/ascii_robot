@@ -148,44 +148,36 @@ impl App {
 
         // Create shader module
         let shader_source = r#"
-    struct VertexOutput {
-        @builtin(position) position: vec4<f32>,
-        @location(0) uv: vec2<f32>,
-    }
+        struct VertexOutput {
+            @builtin(position) position: vec4<f32>,
+            @location(0) uv: vec2<f32>,
+        }
 
-    @vertex
-    fn vs_main(@builtin(vertex_index) vert_idx: u32) -> VertexOutput {
-        let pos = array<vec2<f32>, 4>(
-            vec2<f32>(-1.0, -1.0),  // Bottom-left
-            vec2<f32>(-1.0, 1.0),   // Top-left
-            vec2<f32>(1.0, -1.0),   // Bottom-right
-            vec2<f32>(1.0, 1.0)     // Top-right
-        );
-        
-        let uv = array<vec2<f32>, 4>(
-            vec2<f32>(0.0, 1.0),  // Bottom-left
-            vec2<f32>(0.0, 0.0),  // Top-left
-            vec2<f32>(1.0, 1.0),  // Bottom-right
-            vec2<f32>(1.0, 0.0)   // Top-right
-        );
-        
-        var output: VertexOutput;
-        output.position = vec4<f32>(pos[vert_idx], 0.0, 1.0);
-        output.uv = uv[vert_idx];
-        return output;
-    }
+        @vertex
+        fn vs_main(@builtin(vertex_index) vert_idx: u32) -> VertexOutput {
+            // Create a full-screen quad with proper vertex positions
+            let x = f32(vert_idx / 2) * 4.0 - 1.0;
+            let y = f32(vert_idx % 2) * 4.0 - 1.0;
+            
+            var output: VertexOutput;
+            output.position = vec4<f32>(x, y, 0.0, 1.0);
+            
+            // UV coordinates: flip Y to match texture coordinate system
+            output.uv = vec2<f32>(f32(vert_idx / 2), 1.0 - f32(vert_idx % 2));
+            return output;
+        }
 
-    @group(0) @binding(0)
-    var camera_tex: texture_2d<f32>;
+        @group(0) @binding(0)
+        var camera_tex: texture_2d<f32>;
 
-    @group(0) @binding(1)
-    var camera_sampler: sampler;
+        @group(0) @binding(1)
+        var camera_sampler: sampler;
 
-    @fragment
-    fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-        return textureSample(camera_tex, camera_sampler, input.uv);
-    }
-"#;
+        @fragment
+        fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+            return textureSample(camera_tex, camera_sampler, input.uv);
+        }
+    "#;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Camera Shader"),
@@ -481,7 +473,8 @@ impl App {
             {
                 rpass.set_pipeline(pipeline);
                 rpass.set_bind_group(0, bind_group, &[]);
-                rpass.draw(0..4, 0..1); // Draw quad
+                // Draw 4 vertices as a triangle strip
+                rpass.draw(0..4, 0..1);
             }
         }
 
